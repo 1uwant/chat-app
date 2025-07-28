@@ -1,42 +1,64 @@
-import { parseIsolatedEntityName } from 'typescript';
-import { WebSocketServer, WebSocket }   from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
+import { createClient } from 'redis';
+import * as dotenv from 'dotenv';
 
-const wss = new WebSocketServer({ port: 8080 });
+dotenv.config();
+
+const port = parseInt(process.env.PORT || '8080');
+const REDIS_URL = process.env.REDIS_URL!;
+
+const wss = new WebSocketServer({ port });
+
+const publisher = createClient({ url: REDIS_URL });
+const subscriber = createClient({ url: REDIS_URL });
 
 interface Room {
-    sockets: WebSocket[]
+    sockets: WebSocket[];
 }
-const rooms : Record<string, Room> = {};
+const rooms: Record<string, Room> = {};
 
 interface Data {
-    type: string,
-    room: string,
-    message?: string
+    type: string;
+    room: string;
+    message?: string;
 }
 
-wss.on('connection', (ws) => {
-    ws.on('message', (data : Buffer) => {
-        const parsedData : Data = JSON.parse(data.toString());
+await publisher.connect();
+await subscriber.connect();
 
-        if(parsedData.type === 'join-room'){
-            if(!rooms[parsedData.room]) rooms[parsedData.room] = { sockets: [ws] };
-            else rooms[parsedData.room]!.sockets.push(ws);
+// Listen to relayed messages
+await subscriber.subscribe("chat-relay", (msg) => {
+    const parsed = JSON.parse(msg);
+    const { room, message } = parsed;
+
+    const sockets = rooms[room]?.sockets || [];
+    sockets.forEach(socket => {
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ message }));
+        }
+    });
+});
+
+wss.on("connection", (ws) => {
+    ws.on("message", async (data: Buffer) => {
+        const parsedData: Data = JSON.parse(data.toString());
+
+        if (parsedData.type === "join-room") {
+            const room = parsedData.room;
+            if (!rooms[room]) rooms[room] = { sockets: [] };
+            rooms[room].sockets.push(ws);
+
             ws.send("joined room");
-        }
-        else if(parsedData.type === 'chat' && parsedData.message){
-            // broadcast to others
-            for(const socket of rooms[parsedData.room]!.sockets){
-                socket.send(JSON.stringify({ msg : parsedData.message! }))
-            }
-            ws.send(JSON.stringify({
-                type: "success",
-                msg: "successfully broadcasted"
-            }))
-        }
-        else {
-            ws.close()
-        }
-    })
-})
 
-
+        } else if (parsedData.type === "chat" && parsedData.message) {
+            // Forward to Redis → picked up by relayer
+            await publisher.publish("chat", JSON.stringify({
+                room: parsedData.room,
+                message: parsedData.message
+            }));
+            ws.send("success");
+        } else {
+            ws.close();
+        }
+    });
+});
